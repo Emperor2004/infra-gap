@@ -1,4 +1,56 @@
+# Local datasets and generated outputs
 data/
+*.parquet
+*.geoparquet
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.gpkg
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.pbf
+
+# Generated project outputs
+outputs/
+visualizations/
+reports/generated/
+presentation_pack/data/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# Python environments and cache
+.venv/
+.venv-*/
+venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
 .ipynb_checkpoints/
+
+# Logs, backups, and temporary files
+logs/
+*.log
+*.tmp
+*.bak
+*.backup
+*.backup_*
+*.before_*.bak
+*.pre_hdfs*
+*~
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -20,3 +20,15 @@ print(len(pdf), "hexagons written to severity_hex.csv")
 (sedona.read.parquet(p("out", "taluka_base")).orderBy("severity_per_person", ascending=False)
  .toPandas().to_csv(os.path.join(out_dir, "taluka_ranking.csv"), index=False))
 print("taluka_ranking.csv written")
+
+# Export Stage 4 validation results for report tables and visualizations.
+for filename in ("validation_summary.csv", "validation_by_district.csv"):
+    source = p("out", filename)
+    destination = os.path.join(out_dir, filename)
+
+    if os.path.isfile(source):
+        import shutil
+        shutil.copy2(source, destination)
+        print(f"{filename} copied to visualization directory")
+    else:
+        print(f"WARNING: {source} not found; skipping validation export")

@@ -17,7 +17,10 @@ a = ap.parse_args()
 
 sedona = get_sedona(f"access-score-{a.tag}")
 R = a.radius
-deg = R / 100000.0  # conservative planar pre-filter in degrees (1 degree >= 100 km here)
+# Conservative bounding-box pre-filter for Maharashtra latitudes.
+# Use a wider longitude buffer because longitude degrees shrink with latitude.
+deg_lat = R / 100000.0
+deg_lon = R / 90000.0
 
 sedona.read.parquet(p("out", "hex")).selectExpr(
     "h3", "n_buildings", "pop", "lon", "lat", "ST_Point(lon, lat) AS ctr"
@@ -29,7 +32,9 @@ sedona.read.parquet(p("out", "facilities")).selectExpr(
 with timed(sedona, "access", "distance_join"):
     dist = sedona.sql(f"""
         SELECT h.h3, f.facility_type, MIN(ST_DistanceSphere(h.ctr, f.geom)) AS dist_m
-        FROM hexv h JOIN facv f ON ST_Distance(h.ctr, f.geom) <= {deg}
+        FROM hexv h JOIN facv f
+        ON ABS(ST_X(h.ctr) - ST_X(f.geom)) <= {deg_lon}
+        AND ABS(ST_Y(h.ctr) - ST_Y(f.geom)) <= {deg_lat}
         WHERE ST_DistanceSphere(h.ctr, f.geom) <= {R}
         GROUP BY h.h3, f.facility_type""")
     dist.write.mode("overwrite").parquet(p("staging", f"access_{a.tag}"))
@@ -38,9 +43,9 @@ with timed(sedona, "access", "scoring"):
     sedona.read.parquet(p("staging", f"access_{a.tag}")).createOrReplaceTempView("access")
     sedona.sql(f"""
         SELECT h.h3, h.pop, h.n_buildings, h.lon, h.lat,
-          COALESCE(MAX(IF(x.facility_type = 'hospital',       x.dist_m, NULL)), {R}) AS d_hosp,
-          COALESCE(MAX(IF(x.facility_type = 'school',         x.dist_m, NULL)), {R}) AS d_school,
-          COALESCE(MAX(IF(x.facility_type = 'drinking_water', x.dist_m, NULL)), {R}) AS d_water
+          COALESCE(MIN(IF(x.facility_type = 'hospital',       x.dist_m, NULL)), {R}) AS d_hosp,
+          COALESCE(MIN(IF(x.facility_type = 'school',         x.dist_m, NULL)), {R}) AS d_school,
+          COALESCE(MIN(IF(x.facility_type = 'drinking_water', x.dist_m, NULL)), {R}) AS d_water
         FROM hexv h LEFT JOIN access x ON h.h3 = x.h3
         GROUP BY h.h3, h.pop, h.n_buildings, h.lon, h.lat""").createOrReplaceTempView("scored")
     sedona.sql(f"""
