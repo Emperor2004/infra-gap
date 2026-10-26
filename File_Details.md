@@ -1,10 +1,11 @@
 # File Details: India Infrastructure Gap Mapping
 
 Complete file structure and the full code of every file **you write by hand**.
-Setup: Spark 3.5.x standalone cluster (1 master + 2 workers) in Docker on Windows (WSL2), Apache Sedona 1.9.1, H3.
+Setup: Spark 3.5.x standalone cluster (1 master + 2 workers) on three VMware Workstation VMs (Ubuntu 22.04, OpenJDK 11), Apache Sedona 1.9.1, H3. Hadoop 3.3.6 (HDFS + YARN) runs on the same VMs for Lab 1; the pipeline itself reads and writes a shared NFS folder, `/data`.
 
-> These files supersede the Dockerfile and compose file in `Docker_Cluster_Setup.md` (the project folder is now mounted whole at `/workspace`, and settings live in `config/settings.env`).
-> Create the project **inside WSL** (for example `~/infra-gap`), not under `C:\`.
+> VM, network, Hadoop and NFS setup are in `VM_Cluster_Setup.md` (Sections 2 to 9). This file covers the project files.
+> Run everything on `h-primary` as `h-user`. The project lives in `~/infra-gap`, with two symlinks: `/workspace -> ~/infra-gap` and `~/infra-gap/data -> /data` (created in Section 8).
+> This version replaces the Docker version: `Dockerfile`, `docker-compose.yml`, `.dockerignore` and `.wslconfig` are no longer used.
 
 ---
 
@@ -13,14 +14,15 @@ Setup: Spark 3.5.x standalone cluster (1 master + 2 workers) in Docker on Window
 ```
 infra-gap/
 ├── README.md                      [write]  project overview (delivered separately)
-├── Dockerfile                     [write]
-├── docker-compose.yml             [write]
-├── spark-defaults.conf            [write]
 ├── .gitignore                     [write]
-├── .dockerignore                  [write]
 ├── config/
 │   └── settings.env               [write]  bounding box, H3 resolution, thresholds
-├── prep/                          data preparation (plain Python / bash, run inside the container)
+├── cluster/                       VM cluster files (copied into /opt/spark/conf by install_spark.sh)
+│   ├── install_spark.sh           [write]
+│   ├── spark-defaults.conf        [write]
+│   ├── spark-env.sh               [write]
+│   └── workers                    [write]
+├── prep/                          data preparation (plain Python / bash, run on h-primary)
 │   ├── fetch_buildings.py         [write]
 │   ├── prep_osm.sh                [write]
 │   ├── raster_to_points.py        [write]
@@ -30,7 +32,7 @@ infra-gap/
 ├── src/                           Spark + Sedona jobs (run with spark-submit)
 │   ├── config.py                  [write]
 │   ├── common.py                  [write]
-│   ├── smoke_test.py             [write]
+│   ├── smoke_test.py              [write]
 │   ├── ingest_index.py            [write]
 │   ├── access_score.py            [write]
 │   ├── rollup.py                  [write]
@@ -39,10 +41,12 @@ infra-gap/
 │   └── export_viz.py              [write]
 ├── analysis/
 │   └── make_figures.py            [write]  charts and maps from the real outputs
-├── scripts/                       run helpers (run on the WSL host)
+├── scripts/                       run helpers (run on h-primary)
 │   ├── run_all.sh                 [write]
 │   └── benchmark.sh               [write]
-└── data/                          [GENERATED, git-ignored]
+└── data -> /data                  [symlink to the NFS share, git-ignored]
+
+/data  (NFS export from h-primary, mounted at /data on all three VMs)
     ├── raw/
     │   ├── buildings/             tiles from fetch_buildings.py
     │   ├── osm/                   .osm.pbf files from prep_osm.sh
@@ -54,137 +58,121 @@ infra-gap/
     └── spark-events/              Spark event logs
 ```
 
-Outside the project, one Windows file: `C:\Users\<you>\.wslconfig` (Section 9).
+Outside the project: Hadoop and system files described in `VM_Cluster_Setup.md` (`/etc/hosts`, `/etc/environment`, netplan, `/etc/exports`, `/etc/fstab`, Hadoop XML files).
 
-Create the empty folders once:
+Create the folders once, on `h-primary`:
 
 ```bash
-cd ~/infra-gap
-mkdir -p config prep src analysis scripts data/spark-events
+mkdir -p ~/infra-gap/{config,cluster,prep,src,analysis,scripts}
+sudo ln -sfn ~/infra-gap /workspace
+ln -sfn /data ~/infra-gap/data
+mkdir -p /data/{spark-events,raw,staging,out}      # /data is the NFS export (VM_Cluster_Setup.md Section 8)
 ```
 
 ---
 
-## 2. Docker and cluster files
+## 2. Cluster files (`cluster/`, `config/`)
 
-### `Dockerfile`
+### `cluster/install_spark.sh`
 
-```dockerfile
-FROM eclipse-temurin:11-jdk-jammy
+Run once on `h-primary` as `h-user` after SSH and NFS work. It installs Spark, the Sedona jars and the Python venv, applies the config files below, and copies everything to both workers (same paths on every VM).
 
-ARG SPARK_VER=3.5.7
-ARG SEDONA_VER=1.9.1
-ARG GEOTOOLS_VER=1.9.1-33.5
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-pip curl ca-certificates procps git gdal-bin osmium-tool \
-    && rm -rf /var/lib/apt/lists/*
+SPARK_VER="${SPARK_VER:-3.5.7}"
+SEDONA_VER="${SEDONA_VER:-1.9.1}"
+GEOTOOLS_VER="${GEOTOOLS_VER:-1.9.1-33.5}"
+WORKERS="h-secondary1 h-secondary2"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ME="$(id -un)"
 
-RUN curl -fsSL https://archive.apache.org/dist/spark/spark-${SPARK_VER}/spark-${SPARK_VER}-bin-hadoop3.tgz \
-      | tar xz -C /opt && mv /opt/spark-${SPARK_VER}-bin-hadoop3 /opt/spark
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip curl git gdal-bin osmium-tool rsync
 
-RUN curl -fsSL -o /opt/spark/jars/sedona-spark-shaded-3.5_2.12-${SEDONA_VER}.jar \
-      https://repo1.maven.org/maven2/org/apache/sedona/sedona-spark-shaded-3.5_2.12/${SEDONA_VER}/sedona-spark-shaded-3.5_2.12-${SEDONA_VER}.jar \
- && curl -fsSL -o /opt/spark/jars/geotools-wrapper-${GEOTOOLS_VER}.jar \
-      https://repo1.maven.org/maven2/org/datasyslab/geotools-wrapper/${GEOTOOLS_VER}/geotools-wrapper-${GEOTOOLS_VER}.jar
+if [ ! -x /opt/spark/bin/spark-submit ]; then
+  curl -fsSL "https://archive.apache.org/dist/spark/spark-${SPARK_VER}/spark-${SPARK_VER}-bin-hadoop3.tgz" | sudo tar xz -C /opt
+  sudo mv "/opt/spark-${SPARK_VER}-bin-hadoop3" /opt/spark
+  sudo chown -R "$ME:$ME" /opt/spark
+fi
 
-RUN python3 -m venv /opt/venv \
- && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
- && /opt/venv/bin/pip install --no-cache-dir pyspark==${SPARK_VER} apache-sedona==${SEDONA_VER} \
-      shapely attrs pandas pyarrow geopandas pyogrio "h3>=4" mercantile rasterio requests tqdm scipy matplotlib
+SED_JAR="/opt/spark/jars/sedona-spark-shaded-3.5_2.12-${SEDONA_VER}.jar"
+GEO_JAR="/opt/spark/jars/geotools-wrapper-${GEOTOOLS_VER}.jar"
+[ -f "$SED_JAR" ] || curl -fsSL -o "$SED_JAR" \
+  "https://repo1.maven.org/maven2/org/apache/sedona/sedona-spark-shaded-3.5_2.12/${SEDONA_VER}/sedona-spark-shaded-3.5_2.12-${SEDONA_VER}.jar"
+[ -f "$GEO_JAR" ] || curl -fsSL -o "$GEO_JAR" \
+  "https://repo1.maven.org/maven2/org/datasyslab/geotools-wrapper/${GEOTOOLS_VER}/geotools-wrapper-${GEOTOOLS_VER}.jar"
 
-ENV SPARK_HOME=/opt/spark \
-    PYSPARK_PYTHON=/opt/venv/bin/python \
-    PATH=/opt/spark/bin:/opt/venv/bin:$PATH
+if [ ! -x /opt/venv/bin/python ]; then
+  sudo mkdir -p /opt/venv && sudo chown "$ME:$ME" /opt/venv
+  python3 -m venv /opt/venv
+  /opt/venv/bin/pip install --upgrade pip
+  /opt/venv/bin/pip install "pyspark==${SPARK_VER}" "apache-sedona==${SEDONA_VER}" \
+    shapely attrs pandas pyarrow geopandas pyogrio "h3>=4" mercantile rasterio requests tqdm scipy matplotlib
+fi
 
-COPY spark-defaults.conf /opt/spark/conf/spark-defaults.conf
-WORKDIR /workspace
+cp "$HERE/spark-defaults.conf" "$HERE/spark-env.sh" "$HERE/workers" /opt/spark/conf/
+mkdir -p /var/tmp/spark
+
+for h in $WORKERS; do
+  ssh "$h" "sudo mkdir -p /opt/spark /opt/venv /var/tmp/spark && sudo chown $ME:$ME /opt/spark /opt/venv /var/tmp/spark"
+  rsync -a /opt/spark/ "$h:/opt/spark/"
+  rsync -a /opt/venv/  "$h:/opt/venv/"
+done
+echo "Installed. Start the cluster with: /opt/spark/sbin/start-all.sh"
 ```
 
-If `3.5.7` is not available on archive.apache.org, set `SPARK_VER` to the latest 3.5.x patch.
+If `3.5.7` is not on archive.apache.org, run with `SPARK_VER=<latest 3.5.x patch> cluster/install_spark.sh`. Re-running is safe; it skips what exists and re-copies config.
+Spark's `sbin` is deliberately not on `PATH`: Hadoop also ships a `start-all.sh`. Always call `/opt/spark/sbin/start-all.sh` with the full path.
 
-### `spark-defaults.conf`
+### `cluster/spark-defaults.conf`
 
 ```
-spark.master                   spark://spark-master:7077
+spark.master                   spark://h-primary:7077
 spark.serializer               org.apache.spark.serializer.KryoSerializer
 spark.kryo.registrator         org.apache.sedona.core.serde.SedonaKryoRegistrator
-spark.driver.host              spark-master
+spark.driver.host              h-primary
 spark.driver.bindAddress       0.0.0.0
 spark.sql.shuffle.partitions   40
 spark.sql.adaptive.enabled     true
 spark.eventLog.enabled         true
 spark.eventLog.dir             /data/spark-events
+spark.local.dir                /var/tmp/spark
 ```
 
-### `docker-compose.yml`
+### `cluster/spark-env.sh`
 
-```yaml
-x-spark: &spark
-  build: .
-  image: infragap-spark
-  env_file: ./config/settings.env
-  working_dir: /workspace
-  volumes:
-    - ./data:/data
-    - .:/workspace
-
-services:
-  spark-master:
-    <<: *spark
-    container_name: spark-master
-    hostname: spark-master
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
-              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
-    ports: ["8080:8080", "4040:4040"]
-    mem_limit: 2g
-    cpus: 2
-
-  spark-worker-1:
-    <<: *spark
-    container_name: spark-worker-1
-    hostname: spark-worker-1
-    depends_on: [spark-master]
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
-              "--cores", "5", "--memory", "2500m", "--webui-port", "8081", "spark://spark-master:7077"]
-    ports: ["8081:8081"]
-    mem_limit: 3500m
-    cpus: 5
-
-  spark-worker-2:
-    <<: *spark
-    container_name: spark-worker-2
-    hostname: spark-worker-2
-    depends_on: [spark-master]
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
-              "--cores", "5", "--memory", "2500m", "--webui-port", "8081", "spark://spark-master:7077"]
-    ports: ["8082:8081"]
-    mem_limit: 3500m
-    cpus: 5
+```bash
+export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+export SPARK_MASTER_HOST=h-primary
+export SPARK_WORKER_CORES=4
+export SPARK_WORKER_MEMORY=2g
+export PYSPARK_PYTHON=/opt/venv/bin/python
+export PYSPARK_DRIVER_PYTHON=/opt/venv/bin/python
 ```
 
-Values are set for a 16 GB laptop with a Core i7-12700H. Change `mem_limit`, `cpus`, `--cores`, and `--memory` together if your hardware differs.
+### `cluster/workers`
+
+```
+h-secondary1
+h-secondary2
+```
+
+Values are for 4 vCPU and 3.5 GB RAM per worker VM on a 16 GB host. Change `SPARK_WORKER_CORES`, `SPARK_WORKER_MEMORY`, the VM sizes and the `spark-submit` flags together.
 
 ### `.gitignore`
 
 ```
-data/
+data
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 ```
 
-### `.dockerignore`
-
-```
-data/
-.git/
-__pycache__/
-```
-
 ### `config/settings.env`
 
-Plain `KEY=VALUE` lines (no `export`, no quotes). Compose loads this into every container.
+Plain `KEY=VALUE` lines (no `export`, no quotes). `~/.bashrc` on `h-primary` loads this file (`set -a; . ~/infra-gap/config/settings.env; set +a`), so every prep script and `spark-submit` run sees the variables. Open a new shell after editing.
 
 ```
 # Study area bounding box (degrees). Generous box around the pilot district; adjust.
@@ -204,11 +192,12 @@ T_HOSP_M=10000
 T_SCHOOL_M=3000
 T_WATER_M=2000
 
-# Root folder for data inside the containers
+# Root folder for data (the NFS share, same path on every VM)
 DATA_ROOT=/data
 ```
 
 ---
+
 
 ## 3. Shared Python modules (`src/`)
 
@@ -298,7 +287,7 @@ def severity_sql(t_hosp, t_school, t_water, w=(1 / 3, 1 / 3, 1 / 3)):
 
 ## 4. Data preparation scripts (`prep/`)
 
-Run inside the container, for example `docker compose exec spark-master python prep/fetch_buildings.py`.
+Run on `h-primary` as `h-user`, for example `python prep/fetch_buildings.py` (the venv python is first on `PATH`; `settings.env` is loaded by `~/.bashrc`).
 
 ### `prep/fetch_buildings.py`
 
@@ -553,7 +542,7 @@ print(f"wrote {len(out)} official facilities inside the study box")
 
 ## 5. Spark jobs (`src/`)
 
-Run each with `docker compose exec spark-master spark-submit --driver-memory 1g --executor-memory 2g --total-executor-cores 10 /workspace/src/<job>.py`.
+Run each on `h-primary` with `spark-submit --driver-memory 1g --executor-memory 1500m --total-executor-cores 8 /workspace/src/<job>.py`.
 The helper modules are used only on the driver, so no `--py-files` is needed.
 
 ### `src/smoke_test.py`
@@ -1016,7 +1005,7 @@ if os.path.exists(tpath2):
 
 ---
 
-## 7. Helper scripts (`scripts/`, run on the WSL host)
+## 7. Helper scripts (`scripts/`, run on `h-primary`)
 
 Make both executable: `chmod +x scripts/*.sh`.
 
@@ -1024,90 +1013,83 @@ Make both executable: `chmod +x scripts/*.sh`.
 
 ```bash
 #!/usr/bin/env bash
-# Runs every Spark stage in order. Run the prep steps from README.md first (data must be in data/staging).
+# Runs every Spark stage in order. Run the prep steps from README.md first (data must be in /data/staging).
+# Stop YARN first (stop-yarn.sh): the VMs do not have RAM for YARN and Spark executors together.
 set -euo pipefail
 
-EXEC="docker compose exec -T spark-master"
-SUBMIT="$EXEC spark-submit --driver-memory 1g --executor-memory 2g --total-executor-cores 10"
+SUBMIT="spark-submit --driver-memory 1g --executor-memory 1500m --total-executor-cores 8"
 
 echo "== 1/7 smoke test";   $SUBMIT /workspace/src/smoke_test.py
 echo "== 2/7 ingest+index"; $SUBMIT /workspace/src/ingest_index.py
 echo "== 3/7 access+score"; $SUBMIT /workspace/src/access_score.py --tag base
 echo "== 4/7 rollup";       $SUBMIT /workspace/src/rollup.py --tag base
 
-if [ -f data/staging/official.csv ]; then
+if [ -f /data/staging/official.csv ]; then
   echo "== 5/7 validate";   $SUBMIT /workspace/src/validate.py --tag base
 else
-  echo "== 5/7 validate skipped (no data/staging/official.csv)"
+  echo "== 5/7 validate skipped (no /data/staging/official.csv)"
 fi
 
 echo "== 6/7 sensitivity";  $SUBMIT /workspace/src/sensitivity.py
 echo "== 7/7 export+figures"
 $SUBMIT /workspace/src/export_viz.py
-$EXEC python /workspace/analysis/make_figures.py
-echo "Done. Outputs: data/out/ (figures in data/out/figures, CSVs in data/out/viz)"
+python /workspace/analysis/make_figures.py
+echo "Done. Outputs: /data/out (figures in /data/out/figures, CSVs in /data/out/viz)"
 ```
 
 ### `scripts/benchmark.sh`
 
 ```bash
 #!/usr/bin/env bash
-# Fair timing: local mode gets the same resources as the cluster (10 cores, 7 GB) in its own container.
-# The cluster is stopped first so local mode is not competing for the 10 GB WSL memory.
+# Local mode on h-primary (4 vCPU) vs the 2-worker cluster (8 cores). Run with YARN stopped.
+# Not like for like: local has 4 cores and no network; the cluster has 8 cores plus NFS and network overhead.
 set -euo pipefail
 
-echo "== local mode (cluster stopped)"
-docker compose stop
+echo "== local mode"
 for i in 1 2; do
-  docker run --rm --cpus 10 --memory 7g \
-    --env-file config/settings.env \
-    -v "$PWD/data:/data" -v "$PWD:/workspace" infragap-spark \
-    spark-submit --master "local[10]" --driver-memory 5g \
-      --conf spark.driver.host=localhost --conf spark.driver.bindAddress=127.0.0.1 \
-      /workspace/src/access_score.py --tag bench_local
+  spark-submit --master "local[4]" --driver-memory 2g \
+    --conf spark.driver.host=localhost --conf spark.driver.bindAddress=127.0.0.1 \
+    /workspace/src/access_score.py --tag bench_local
 done
 
 echo "== cluster mode"
-docker compose up -d
-sleep 15
+/opt/spark/sbin/start-all.sh || true
+sleep 10
 for i in 1 2; do
-  docker compose exec -T spark-master spark-submit \
-    --driver-memory 1g --executor-memory 2g --total-executor-cores 10 \
+  spark-submit --driver-memory 1g --executor-memory 1500m --total-executor-cores 8 \
     /workspace/src/access_score.py --tag bench_cluster
 done
 
-docker compose exec -T spark-master python /workspace/analysis/make_figures.py
-echo "Timings are in data/out/timings.csv; runtime chart in data/out/figures/fig_runtime.png"
+python /workspace/analysis/make_figures.py
+echo "Timings are in /data/out/timings.csv; runtime chart in /data/out/figures/fig_runtime.png"
 ```
 
-Report the numbers you get. On a one-district dataset, local mode may be faster; say so and explain that the cluster demonstrates the architecture.
+Report the numbers you get, from one host configuration (see `VM_Cluster_Setup.md` Section 11 on Hyper-V). On a one-district dataset, local mode may be faster; say so and explain that the cluster demonstrates the architecture, not extra hardware.
 
 ---
 
 ## 8. Order of work (what you write, what you run)
 
-1. Create the folders and write all files above (Sections 2 to 7).
-2. `docker compose up -d --build` (first build takes several minutes).
-3. Smoke test (Section 5, `smoke_test.py`) and fix anything before continuing.
-4. Prep steps (commands are in `README.md`, "Run the pipeline").
-5. `scripts/run_all.sh`.
-6. `scripts/benchmark.sh`.
-7. Take screenshots (Spark UI at `localhost:8080` and `localhost:4040`, terminal outputs, Kepler.gl map) and copy figures from `data/out/figures/` into the report.
+1. Build the three VMs, network, SSH, Hadoop and the NFS share: `VM_Cluster_Setup.md` Sections 2 to 8. Check HDFS (`:9870`) and YARN (`:8088`) for Lab 1, then `stop-yarn.sh`.
+2. Create the project folders and symlinks (Section 1) and write all files above (Sections 2 to 7). Add the `settings.env` loader to `~/.bashrc` and open a new shell.
+3. `chmod +x cluster/install_spark.sh scripts/*.sh`, then `cluster/install_spark.sh`.
+4. `/opt/spark/sbin/start-all.sh`; open `http://<h-primary IP>:8080` and confirm 2 workers ALIVE.
+5. Smoke test (`src/smoke_test.py`, Section 5). Fix anything before continuing.
+6. Prep steps (commands are in `README.md`, "Run the pipeline").
+7. `scripts/run_all.sh`.
+8. `scripts/benchmark.sh`.
+9. Take screenshots (HDFS `:9870`, YARN `:8088`, Spark UI `:8080` and `:4040`, terminal outputs, Kepler.gl map) and copy figures from `/data/out/figures/` into the report.
 
 ---
 
-## 9. Windows file (outside the project)
+## 9. VM resource settings (replaces the Windows `.wslconfig`)
 
-### `C:\Users\<you>\.wslconfig`
+| VM | RAM | vCPU | Disk (thin) |
+|---|---|---|---|
+| `h-primary` | 4096 MB | 4 | 40 GB |
+| `h-secondary1`, `h-secondary2` | 3584 MB each | 4 each | 20 GB each |
 
-```ini
-[wsl2]
-memory=10GB
-processors=14
-swap=2GB
-```
-
-Apply with `wsl --shutdown` in PowerShell, then restart Docker Desktop.
+Set in VMware Workstation (VM Settings, with the VM shut down). Windows keeps about 5 GB. Details, network and NFS steps: `VM_Cluster_Setup.md`.
 
 ---
 
@@ -1117,4 +1099,7 @@ Apply with `wsl --shutdown` in PowerShell, then restart Docker Desktop.
 - Function names (`ST_H3CellIDs`, `ST_H3ToGeom`, `ST_DistanceSphere`) and the Microsoft manifest header are assumed; scripts print or assert so you see failures immediately.
 - The building-tile format is assumed to be one GeoJSON feature per line. `ingest_index.py` checks a sample and stops with an instruction if not.
 - `prep_boundaries.py` and `prep_official.py` depend on column names in files I have not seen; both print columns or take them as arguments.
-- Spark writes under `data/` as root inside the containers. If Windows or WSL complains about permissions, run `sudo chown -R $USER data` in WSL.
+- The pipeline needs `/data` mounted on all three VMs. If a worker reports missing files, run `df -h /data` on it; `sudo mount -a` fixes a lost mount.
+- `h-user` must have the same uid on all VMs, or workers cannot write to `/data`. Check with `id h-user`.
+- Spark writes under `/data` as `h-user` from the workers; if a stage fails with `Permission denied`, check ownership with `ls -ld /data /data/out`.
+- The VM and Spark settings (executor memory, cores, NFS options) are sized by estimate for a 16 GB host, not measured. Expect to lower `--executor-memory` or `--total-executor-cores` if a VM runs out of memory.
