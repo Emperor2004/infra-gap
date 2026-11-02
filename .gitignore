@@ -69,3 +69,6 @@ __pycache__/
 
 # Dashboard backups
 dashboard/app_backup*.py
+
+# Local agent configuration and environment-specific symlinks
+.agents/
