@@ -54,3 +54,18 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Python temporary files
+__pycache__/
+*.py[cod]
+
+# Streamlit temporary files
+.streamlit/secrets.toml
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+
+# Dashboard backups
+dashboard/app_backup*.py
